@@ -1,0 +1,400 @@
+#!/bin/bash
+
+# yapman - A wrapper script for pacman and yay
+# Usage: yapman package_name
+
+show_help() {
+    echo "yapman - A wrapper for pacman and yay"
+    echo "Usage: yapman [options] [package]"
+    echo ""
+    echo "Options:"
+    echo "  -h, --help                 Show this help message"
+    echo "  -S                         Install a package"
+    echo "  -PKG                       Install a package from source using PKGBUILD"
+    echo "  -Ss                        Search for a package"
+    echo "  -Bfs                       Search GitHub, GitLab, and Bitbucket for a repository"
+    echo "  -Syu                       Update system and AUR packages"
+    echo "  -R                         Remove a package"
+    echo "  -Rs                        Remove a package and its dependencies"
+    echo "  -Q                         Query installed packages"
+    echo "  -Qi                        Display information about installed packages"
+    echo "  --contribute               Contribute a PKGBUILD to the community repository"
+}
+
+# Check if no arguments provided
+if [ $# -eq 0 ]; then
+    show_help
+    exit 1
+fi
+
+# Handle help flag
+if [ "$1" == "-h" ] || [ "$1" == "--help" ]; then
+    show_help
+    exit 0
+fi
+
+# Function to check if a command exists
+command_exists() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+# Function to import PGP keys
+import_pgp_keys() {
+    local pkgbuild="$1"
+    local keys
+    
+    source "$pkgbuild"
+    
+    if [ ${#validpgpkeys[@]} -gt 0 ]; then
+        echo "==> Importing PGP keys..."
+        for key in "${validpgpkeys[@]}"; do
+            echo "==> Importing key: $key"
+            gpg --recv-keys "$key" 2>/dev/null || {
+                for server in "keyserver.ubuntu.com" "pgp.mit.edu" "keys.gnupg.net"; do
+                    echo "==> Trying alternate keyserver: $server"
+                    gpg --keyserver "$server" --recv-keys "$key" && break
+                done
+            }
+        done
+    fi
+}
+
+# Check if required commands are available
+if ! command_exists pacman; then
+    echo "Error: pacman is not installed"
+    exit 1
+fi
+
+if ! command_exists yay; then
+    echo "Warning: yay is not installed. Only pacman operations will be available."
+fi
+
+# Function to build packages from source
+build_from_source() {
+    local package_name="$1"
+    local temp_dir
+    temp_dir=$(mktemp -d)
+    local build_success=false
+    
+    echo "==> Creating temporary build directory: $temp_dir"
+    cd "$temp_dir" || exit 1
+
+    # First try official repositories using asp
+    if command_exists asp; then
+        echo "==> Checking official repositories for package..."
+        if asp checkout "$package_name" 2>/dev/null; then
+            if [ -d "$package_name/repos/core-x86_64" ]; then
+                cd "$package_name/repos/core-x86_64" || exit 1
+                build_success=true
+            elif [ -d "$package_name/repos/extra-x86_64" ]; then
+                cd "$package_name/repos/extra-x86_64" || exit 1
+                build_success=true
+            elif [ -d "$package_name/trunk" ]; then
+                cd "$package_name/trunk" || exit 1
+                build_success=true
+            fi
+            
+            if [ "$build_success" = true ]; then
+                echo "==> Found package in official repositories"
+            fi
+        else
+            echo "==> Package not found in official repositories"
+        fi
+    else
+        echo "Warning: asp is not installed. Skipping official repository check."
+    fi
+
+    # If not found in official repos, try AUR
+    if [ "$build_success" = false ]; then
+        if command_exists git; then
+            echo "==> Checking AUR for package..."
+            if git clone "https://aur.archlinux.org/${package_name}.git" .; then
+                echo "==> Successfully found package in AUR"
+                build_success=true
+            else
+                echo "Error: Package not found in AUR either"
+                cd
+                rm -rf "$temp_dir"
+                exit 1
+            fi
+        else
+            echo "Error: git is not installed"
+            cd
+            rm -rf "$temp_dir"
+            exit 1
+        fi
+    fi
+
+    # Check if PKGBUILD exists
+    if [ ! -f PKGBUILD ]; then
+        echo "Error: PKGBUILD not found"
+        repo_url=$(git remote get-url origin)
+        if [[ "$repo_url" =~ (https?://[^.]+(\.[^.]+)+) ]]; then
+            xdg-open "$repo_url" &
+        else
+            echo "No valid repository URL found."
+        fi
+        cd
+        rm -rf "$temp_dir"
+        exit 1
+    fi
+
+    # Show PKGBUILD and ask for confirmation
+    echo "==> Found PKGBUILD for $package_name"
+    echo "==> Source: $(if [ "$build_success" = true ]; then echo "Official Repository"; else echo "AUR"; fi)"
+    echo "==> Review the PKGBUILD contents:"
+    echo "----------------------------------------------------------------"
+    cat PKGBUILD
+    echo "----------------------------------------------------------------"
+    
+    read -rp "==> Proceed with building? [Y/n] " response
+    response=${response:-Y}
+    
+    if [[ "$response" =~ ^[Yy]$ ]]; then
+        # Install build dependencies
+        if command_exists yay; then
+            echo "==> Installing build dependencies..."
+            source PKGBUILD
+            if [ ${#makedepends[@]} -gt 0 ] || [ ${#depends[@]} -gt 0 ]; then
+                yay -S --needed "${makedepends[@]}" "${depends[@]}"
+            fi
+        else
+            echo "Warning: yay not installed. Build dependencies must be installed manually."
+        fi
+
+        # Import PGP keys if needed
+        import_pgp_keys "PKGBUILD"
+
+        # Build the package
+        echo "==> Building package..."
+        if ! makepkg -si; then
+            echo "==> Build failed. Checking for common issues..."
+            if grep -q "PGP signature" /tmp/makepkg.log 2>/dev/null; then
+                echo "==> Retrying PGP key import..."
+                import_pgp_keys "PKGBUILD"
+                echo "==> Retrying build..."
+                makepkg -si
+            fi
+        fi
+
+        # Clean up
+        echo "==> Cleaning up..."
+        cd || exit 1
+        rm -rf "$temp_dir"
+        echo "==> Build process completed"
+    else
+        echo "Build cancelled."
+        cd || exit 1
+        rm -rf "$temp_dir"
+        exit 0
+    fi
+}
+
+# Function for searching repositories and opening source URLs
+search_repository() {
+    local term="$1"
+    local repo_list=()
+    local counter=1
+
+    echo "==> Searching GitHub..."
+    while read -r line; do
+        repo_list+=("$line")
+    done < <(curl -s "https://api.github.com/search/repositories?q=${term}" | jq -r '.items[] | "\(.full_name) - \(.html_url)"')
+
+    echo "==> Searching GitLab..."
+    while read -r line; do
+        repo_list+=("$line")
+    done < <(curl -s "https://gitlab.com/api/v4/projects?search=${term}" | jq -r '.[] | "\(.name) - \(.web_url)"')
+
+    echo "==> Searching Bitbucket..."
+    while read -r line; do
+        repo_list+=("$line")
+    done < <(curl -s "https://api.bitbucket.org/2.0/repositories?search=${term}" | jq -r '.values[] | "\(.full_name) - \(.links.html.href)"')
+
+    if [ ${#repo_list[@]} -eq 0 ]; then
+        echo "No results found across all platforms."
+        return
+    fi
+
+    echo "==> Select a repository to clone and build:"
+    for repo in "${repo_list[@]}"; do
+        echo "$counter) $repo"
+        ((counter++))
+    done
+
+    echo "Enter the number of the repository to clone (or 'q' to quit):"
+    read -r choice
+
+    if [[ "$choice" == "q" ]]; then
+        echo "Exiting..."
+        return
+    elif [[ "$choice" =~ ^[0-9]+$ && "$choice" -ge 1 && "$choice" -lt "$counter" ]]; then
+        selected_repo="${repo_list[$((choice - 1))]}"
+        repo_url=$(echo "$selected_repo" | awk -F" - " '{print $2}')
+        repo_name=$(basename "$repo_url" .git)
+
+        # Open the repository URL in the default web browser
+        xdg-open "$repo_url" &
+
+        # Check if the package is already installed
+        if pacman -Qq | grep -q "^$repo_name$"; then
+            echo "==> Package $repo_name is already installed."
+            return
+        fi
+        
+        # Check if the package directory already exists
+        if [ -d "$repo_name" ]; then
+            echo "==> Directory $repo_name already exists. Skipping clone."
+        else
+            echo "Cloning $repo_name from $repo_url..."
+            git clone "$repo_url" || { echo "Error: Failed to clone repository."; return; }
+        fi
+        
+        # Check for PKGBUILD and build
+        if [[ -f "$repo_name/PKGBUILD" ]]; then
+            cd "$repo_name" || return
+            build_from_source "$repo_name"
+        else
+            echo "No PKGBUILD found in the cloned repository. Opening repository page in browser..."
+            xdg-open "$repo_url" &  # Open the repository URL if PKGBUILD is not found
+        fi
+    else
+        echo "Invalid choice. Please try again."
+    fi
+}
+
+# Function to contribute PKGBUILD to community repository
+contribute_pkgbuild() {
+    local pkgbuild_path="$1"
+    local contrib_repo="https://github.com/AcreetionOS-Linux/PKGBUILDs.git"
+    local temp_dir
+
+    if [ ! -f "$pkgbuild_path" ]; then
+        echo "Error: PKGBUILD file not found at specified path."
+        exit 1
+    fi
+
+    temp_dir=$(mktemp -d)
+    cd "$temp_dir" || exit 1
+
+    echo "==> Cloning community PKGBUILD repository..."
+    git clone "$contrib_repo" . || { echo "Error: Failed to clone community repository."; return; }
+
+    # Copy the PKGBUILD file to the cloned repo
+    cp "$pkgbuild_path" . || { echo "Error: Failed to copy PKGBUILD file."; cd ..; rm -rf "$temp_dir"; exit 1; }
+    
+    # Commit and push the changes
+    git add "$(basename "$pkgbuild_path")"
+    read -rp "==> Enter commit message: " commit_message
+    git commit -m "${commit_message:-'Add new PKGBUILD'}"
+    
+    # Push changes
+    if git push; then
+        echo "==> Successfully contributed your PKGBUILD!"
+    else
+        echo "Error: Failed to push changes. Please check your git configuration."
+    fi
+
+    cd .. && rm -rf "$temp_dir"
+}
+
+case "$1" in
+    "-PKG")
+        if [ -z "$2" ]; then
+            echo "Error: No package specified"
+            exit 1
+        fi
+        build_from_source "$2"
+        ;;
+
+    "-S")
+        if [ -z "$2" ]; then
+            echo "Error: No package specified"
+            exit 1
+        fi
+        # First try pacman
+        if pacman -Ss "^$2$" >/dev/null 2>&1; then
+            sudo pacman -S "$2"
+        else
+            # If package not found in official repos, try yay
+            if command_exists yay; then
+                yay -S "$2"
+            else
+                echo "Package not found in official repositories and yay is not installed"
+                exit 1
+            fi
+        fi
+        ;;
+
+    "-Ss")
+        if [ -z "$2" ]; then
+            echo "Error: No search term specified"
+            exit 1
+        fi
+        echo "==> Searching official repositories..."
+        pacman -Ss "$2"
+        if command_exists yay; then
+            echo "==> Searching AUR..."
+            yay -Ss "$2"
+        fi
+        ;;
+    
+    "-Bfs")
+        if [ -z "$2" ]; then
+            echo "Error: No search term specified"
+            exit 1
+        fi
+        search_repository "$2"
+        ;;
+    
+    "-Syu")
+        echo "==> Updating system packages..."
+        sudo pacman -Syu
+        if command_exists yay; then
+            echo "==> Updating AUR packages..."
+            yay -Syu
+        fi
+        ;;
+    
+    "-R")
+        if [ -z "$2" ]; then
+            echo "Error: No package specified"
+            exit 1
+        fi
+        sudo pacman -R "$2"
+        ;;
+    
+    "-Rs")
+        if [ -z "$2" ]; then
+            echo "Error: No package specified"
+            exit 1
+        fi
+        sudo pacman -Rs "$2"
+        ;;
+    
+    "-Q")
+        pacman -Q "$2"
+        ;;
+    
+    "-Qi")
+        if [ -z "$2" ]; then
+            echo "Error: No package specified"
+            exit 1
+        fi
+        pacman -Qi "$2"
+        ;;
+    
+    "--contribute")
+        if [ -z "$2" ]; then
+            echo "Error: No PKGBUILD specified"
+            exit 1
+        fi
+        contribute_pkgbuild "$2"
+        ;;
+    
+    *)
+        echo "Invalid option: $1"
+        show_help
+        exit 1
+        ;;
+esac
