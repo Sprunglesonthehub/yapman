@@ -9,15 +9,23 @@ show_help() {
     echo ""
     echo "Options:"
     echo "  -h, --help                 Show this help message"
-    echo "  -S                         Install a package"
-    echo "  -PKG                       Install a package from source using PKGBUILD"
+    echo "  -S                         Install a package (no confirmation)"
+    echo "  -Sc                        Install a package (confirmation required)"
+    echo "  -PKG                       Install a package from source using PKGBUILD (confirmation required)"
+    echo "  -PKGc                      Install a package from source using PKGBUILD (no confirmation)"
     echo "  -Ss                        Search for a package"
-    echo "  -Bfs                       Search GitHub, GitLab, and Bitbucket for a repository"
-    echo "  -Syu                       Update system and AUR packages"
-    echo "  -R                         Remove a package"
-    echo "  -Rs                        Remove a package and its dependencies"
+    echo "  -Bfs                       Search for a package in Arch repositories and AUR, then build from source if available (no confirmation)"
+    echo "  -Bfsc                      Search for a package in Arch repositories and AUR, then build (confirmation required)"
+    echo "  -Syu                       Update system and AUR packages (no confirmation)"
+    echo "  -Syuc                      Update system and AUR packages (confirmation required)"
+    echo "  -R                         Remove a package (no confirmation)"
+    echo "  -Rc                        Remove a package (confirmation required)"
+    echo "  -Rs                        Remove a package and its dependencies (no confirmation)"
+    echo "  -Rsc                       Remove a package and its dependencies (confirmation required)"
     echo "  -Q                         Query installed packages"
     echo "  -Qi                        Display information about installed packages"
+    echo "  -SR                        Refresh package databases (no confirmation)"
+    echo "  -SRc                       Refresh package databases (confirmation required)"
     echo "  --contribute               Contribute a PKGBUILD to the community repository"
 }
 
@@ -156,7 +164,7 @@ build_from_source() {
             echo "==> Installing build dependencies..."
             source PKGBUILD
             if [ ${#makedepends[@]} -gt 0 ] || [ ${#depends[@]} -gt 0 ]; then
-                yay -S --needed "${makedepends[@]}" "${depends[@]}"
+                yay -S --needed --noconfirm "${makedepends[@]}" "${depends[@]}"
             fi
         else
             echo "Warning: yay not installed. Build dependencies must be installed manually."
@@ -167,13 +175,13 @@ build_from_source() {
 
         # Build the package
         echo "==> Building package..."
-        if ! makepkg -si; then
+        if ! makepkg -si --noconfirm; then
             echo "==> Build failed. Checking for common issues..."
             if grep -q "PGP signature" /tmp/makepkg.log 2>/dev/null; then
                 echo "==> Retrying PGP key import..."
                 import_pgp_keys "PKGBUILD"
                 echo "==> Retrying build..."
-                makepkg -si
+                makepkg -si --noconfirm
             fi
         fi
 
@@ -307,22 +315,48 @@ case "$1" in
         build_from_source "$2"
         ;;
 
+    "-PKGc")
+        if [ -z "$2" ]; then
+            echo "Error: No package specified"
+            exit 1
+        fi
+        # Here you can add confirmation logic before building
+        read -rp "==> Proceed with building the package from source? [Y/n] " response
+        if [[ "$response" =~ ^[Yy]$ ]]; then
+            build_from_source "$2"
+        else
+            echo "Cancelled."
+            exit 0
+        fi
+        ;;
+
     "-S")
         if [ -z "$2" ]; then
             echo "Error: No package specified"
             exit 1
         fi
-        # First try pacman
-        if pacman -Ss "^$2$" >/dev/null 2>&1; then
+        # Refresh package databases before installing
+        echo "==> Refreshing package databases..."
+        sudo pacman -Sy
+        # Try to install the package without confirmation
+        sudo pacman -S --noconfirm "$2"
+        ;;
+
+    "-Sc")
+        if [ -z "$2" ]; then
+            echo "Error: No package specified"
+            exit 1
+        fi
+        # Refresh package databases before installing
+        echo "==> Refreshing package databases..."
+        sudo pacman -Sy
+        # Ask for confirmation before installing the package
+        read -rp "==> Proceed with installing $2? [Y/n] " response
+        if [[ "$response" =~ ^[Yy]$ ]]; then
             sudo pacman -S "$2"
         else
-            # If package not found in official repos, try yay
-            if command_exists yay; then
-                yay -S "$2"
-            else
-                echo "Package not found in official repositories and yay is not installed"
-                exit 1
-            fi
+            echo "Cancelled."
+            exit 0
         fi
         ;;
 
@@ -341,38 +375,149 @@ case "$1" in
     
     "-Bfs")
         if [ -z "$2" ]; then
-            echo "Error: No search term specified"
+            echo "Error: No package specified"
             exit 1
         fi
+        
+        # Attempt to build from Arch official repos first
+        if command_exists asp; then
+            echo "==> Checking official repositories for PKGBUILD..."
+            if asp checkout "$2" 2>/dev/null; then
+                echo "Found PKGBUILD in official repositories."
+                build_from_source "$2"
+                exit 0
+            fi
+        fi
+        
+        # Attempt to build from AUR
+        if command_exists git; then
+            echo "==> Checking AUR for PKGBUILD..."
+            if git clone "https://aur.archlinux.org/${2}.git" "${2}-aur" 2>/dev/null; then
+                echo "Found PKGBUILD in AUR."
+                cd "${2}-aur" || exit 1
+                build_from_source "${2}-aur"
+                exit 0
+            fi
+        fi
+        
+        # If not found in official repos or AUR, proceed with searching for repositories
         search_repository "$2"
         ;;
-    
+
+    "-Bfsc")
+        if [ -z "$2" ]; then
+            echo "Error: No package specified"
+            exit 1
+        fi
+        
+        # Ask for confirmation before proceeding with the search and build
+        read -rp "==> Proceed with searching and building $2? [Y/n] " response
+        if [[ "$response" =~ ^[Yy]$ ]]; then
+            # Attempt to build from Arch official repos first
+            if command_exists asp; then
+                echo "==> Checking official repositories for PKGBUILD..."
+                if asp checkout "$2" 2>/dev/null; then
+                    echo "Found PKGBUILD in official repositories."
+                    build_from_source "$2"
+                    exit 0
+                fi
+            fi
+            
+            # Attempt to build from AUR
+            if command_exists git; then
+                echo "==> Checking AUR for PKGBUILD..."
+                if git clone "https://aur.archlinux.org/${2}.git" "${2}-aur" 2>/dev/null; then
+                    echo "Found PKGBUILD in AUR."
+                    cd "${2}-aur" || exit 1
+                    build_from_source "${2}-aur"
+                    exit 0
+                fi
+            fi
+            
+            # If not found in official repos or AUR, proceed with searching for repositories
+            search_repository "$2"
+        else
+            echo "Cancelled."
+            exit 0
+        fi
+        ;;
+
     "-Syu")
         echo "==> Updating system packages..."
-        sudo pacman -Syu
+        sudo pacman -Syu --noconfirm
         if command_exists yay; then
             echo "==> Updating AUR packages..."
-            yay -Syu
+            yay -Syu --noconfirm
         fi
         ;;
     
+    "-Syuc")
+        echo "==> Updating system packages..."
+        # Ask for confirmation before updating
+        read -rp "==> Proceed with updating packages? [Y/n] " response
+        if [[ "$response" =~ ^[Yy]$ ]]; then
+            sudo pacman -Syu
+            if command_exists yay; then
+                echo "==> Updating AUR packages..."
+                yay -Syu
+            fi
+        else
+            echo "Cancelled."
+            exit 0
+        fi
+        ;;
+
     "-R")
         if [ -z "$2" ]; then
             echo "Error: No package specified"
             exit 1
         fi
-        sudo pacman -R "$2"
+        sudo pacman -R --noconfirm "$2"
         ;;
     
+    "-Rc")
+        if [ -z "$2" ]; then
+            echo "Error: No package specified"
+            exit 1
+        fi
+        # Ask for confirmation before removing the package
+        read -rp "==> Proceed with removing $2? [Y/n] " response
+        if [[ "$response" =~ ^[Yy]$ ]]; then
+            sudo pacman -R "$2"
+        else
+            echo "Cancelled."
+            exit 0
+        fi
+        ;;
+
     "-Rs")
         if [ -z "$2" ]; then
             echo "Error: No package specified"
             exit 1
         fi
-        sudo pacman -Rs "$2"
+        sudo pacman -Rs --noconfirm "$2"
         ;;
     
+    "-Rsc")
+        if [ -z "$2" ]; then
+            echo "Error: No package specified"
+            exit 1
+        fi
+        # Ask for confirmation before removing the package and its dependencies
+        read -rp "==> Proceed with removing $2 and its dependencies? [Y/n] " response
+        if [[ "$response" =~ ^[Yy]$ ]]; then
+            sudo pacman -Rs "$2"
+        else
+            echo "Cancelled."
+            exit 0
+        fi
+        ;;
+
     "-Q")
+        if [ -z "$2" ]; then
+            echo "Error: No package specified"
+            exit 1
+        fi
         pacman -Q "$2"
         ;;
     
@@ -384,6 +529,23 @@ case "$1" in
         pacman -Qi "$2"
         ;;
     
+    "-SR")
+        echo "==> Refreshing package databases..."
+        sudo pacman -Sy --noconfirm
+        ;;
+    
+    "-SRc")
+        # Ask for confirmation before refreshing the package databases
+        read -rp "==> Proceed with refreshing package databases? [Y/n] " response
+        if [[ "$response" =~ ^[Yy]$ ]]; then
+            echo "==> Refreshing package databases..."
+            sudo pacman -Sy
+        else
+            echo "Cancelled."
+            exit 0
+        fi
+        ;;
+
     "--contribute")
         if [ -z "$2" ]; then
             echo "Error: No PKGBUILD specified"
